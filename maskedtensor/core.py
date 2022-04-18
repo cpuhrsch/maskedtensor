@@ -5,7 +5,6 @@ import os
 
 import torch
 from torch.overrides import get_default_nowrap_functions
-from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 logging.basicConfig(level=getattr(logging, os.getenv("MTLOGLEVEL", "INFO")))
 
@@ -33,6 +32,9 @@ def masks_match(a, b):
 
 
 def masked_tensor_str(data, mask, formatter):
+    if data.layout == torch.sparse_coo:
+        data = data.to_dense()
+        mask = mask.to_dense()
     if data.dim() == 1:
         formatted_elements = [
             formatter.format(d.item()) if isinstance(d.item(), float) else str(d.item())
@@ -112,6 +114,18 @@ class MaskedWhere(torch.autograd.Function):
         )
 
 
+MASKEDTENSOR_ALLOWED_DTYPES = {
+    torch.float16,
+    torch.float32,
+    torch.float64,
+    torch.bool,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+}
+
+
 class MaskedTensor(torch.Tensor):
     @staticmethod
     def __new__(cls, data, mask, requires_grad=False):
@@ -121,37 +135,31 @@ class MaskedTensor(torch.Tensor):
         kwargs["dtype"] = data.dtype
         kwargs["layout"] = data.layout
         kwargs["requires_grad"] = requires_grad
-        return torch.Tensor._make_wrapper_subclass(cls, data.size(), **kwargs)
+        return torch.Tensor._make_wrapper_subclass(cls, data.size(), **kwargs)  # type: ignore[attr-defined]
 
     def _validate_members(self):
         data = self.masked_data
         mask = self.masked_mask
         assert type(data) == type(mask)
+        assert data.layout == mask.layout
+        assert data.layout in [torch.strided, torch.sparse_coo]
         assert torch.is_tensor(data)
         assert mask.dtype == torch.bool
-        assert (
-            data.dtype == torch.float16
-            or data.dtype == torch.float32
-            or data.dtype == torch.float64
-            or data.dtype == torch.bool
-            or data.dtype == torch.int8
-            or data.dtype == torch.int16
-            or data.dtype == torch.int32
-            or data.dtype == torch.int64
-        )
+        assert data.dtype in MASKEDTENSOR_ALLOWED_DTYPES
         assert data.dim() == mask.dim()
         assert data.size() == mask.size()
         assert not mask.requires_grad
 
     def __init__(self, data, mask, requires_grad=False):
         logging.debug(f"----in\ntype(data): {type(data)} type(mask): {type(mask)}")
+        assert data.layout == mask.layout
+        if data.layout == torch.strided:
+            # .contiguous cannot be overwritten so it's always contiguous
+            data = data.contiguous()
+            mask = mask.contiguous()
 
-        # .contiguous cannot be overwritten so it's always contiguous
-        data = data.contiguous()
-        mask = mask.contiguous()
         logging.debug(f"data.dim(): {data.dim()}  mask.dim(): {mask.dim()}")
         logging.debug(f"data.size(): {data.size()} mask.size(): {mask.size()}")
-        logging.debug(f"data.stride(): {data.stride()} mask.stride(): {mask.stride()}")
         logging.debug(f"data: {data}")
         logging.debug(f"mask: {mask}")
         # Have to pick awkward names to not conflict with existing fields such as data
@@ -162,9 +170,10 @@ class MaskedTensor(torch.Tensor):
     def _set_data_mask(self, data, mask):
         # This method is regrettably necessary for in-place operations
 
-        # .contiguous cannot be overwritten so it's always contiguous
-        data = data.contiguous()
-        mask = mask.contiguous()
+        if data.layout == torch.strided:
+            # .contiguous cannot be overwritten so it's always contiguous
+            data = data.contiguous()
+            mask = mask.contiguous()
 
         self.masked_data = data
         self.masked_mask = mask
@@ -258,7 +267,7 @@ class MaskedTensor(torch.Tensor):
         if func in [torch.ops.aten.mm, torch.ops.aten.bmm]:
             len(args) == 2
             len(kwargs) == 0
-            return cls.matmul(args[0], args[1], func)
+            return cls.matmul(args[0], args[1], func)  # type: ignore[call-arg]
         # Doesn't work for addmm where the first argument is a Tensor
         data = get_data(args[0])
         mask = get_mask(args[0])
@@ -318,21 +327,6 @@ class MaskedTensor(torch.Tensor):
             assert masks_match(get_mask(args[0]), get_mask(args[1]))
             func(data, get_data(args[1]))
             return args[0]
-        if func in [torch.ops.aten._s_where]:
-            assert len(kwargs) == 0
-            assert len(args) == 3
-            assert torch.is_tensor(args[0])
-            mx = args[1]
-            my = args[2]
-            if not is_masked_tensor(mx):
-                mx = MaskedTensor(mx, torch.ones_like(mx).bool())
-            if not is_masked_tensor(my):
-                my = MaskedTensor(my, torch.ones_like(my).bool())
-            assert is_masked_tensor(mx)
-            assert is_masked_tensor(my)
-            new_data = func(args[0], get_data(mx), get_data(my))
-            new_mask = func(args[0], get_mask(mx), get_mask(my))
-            return MaskedTensor(new_data, new_mask)
         msg = (
             f"{func.__name__} is not implemented in __torch_dispatch__.\n"
             "If you would like this operator to be supported, please file an issue for a feature request at "
@@ -351,3 +345,10 @@ class MaskedTensor(torch.Tensor):
 
     def mask(self):
         return self.masked_mask
+
+    def is_sparse_coo(self):
+        return self.layout == torch.sparse_coo
+
+    # Update later to support more sparse layouts
+    def is_sparse(self):
+        return self.is_sparse_coo()

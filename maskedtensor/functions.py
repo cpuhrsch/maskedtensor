@@ -5,8 +5,6 @@ import math
 import torch
 from torch.nn.functional import dropout, linear
 
-from .creation import masked_tensor
-
 Tensor = torch.Tensor
 
 
@@ -14,7 +12,6 @@ def _in_projection_packed(q, k, v, w, b):
     # if is_masked_tensor(k):
     #     assert not is_masked_tensor(q)
     #     assert not is_masked_tensor(v)
-    E = q.size(-1)
     w_q, w_k, w_v = w.chunk(3)
     assert b is None
     b_q = b_k = b_v = None
@@ -60,6 +57,7 @@ def multi_head_attention_forward(
     v_proj_weight,
     static_k,
     static_v,
+    average_attn_weights,
 ):
     # set up shape vars
     tgt_len, bsz, embed_dim = query.shape
@@ -135,6 +133,8 @@ def multi_head_attention_forward(
     if need_weights:
         # average attention weights over heads
         attn_output_weights = attn_output_weights.view(bsz, num_heads, tgt_len, src_len)
-        return attn_output, attn_output_weights.sum(dim=1) / num_heads
+        if average_attn_weights:
+            attn_output_weights = attn_output_weights.sum(dim=1) / num_heads
+        return attn_output, attn_output_weights
     else:
         return attn_output, None
